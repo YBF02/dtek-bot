@@ -34,6 +34,7 @@ DAILY_HOUR = int(os.getenv("DAILY_HOUR", "7"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 FAIL_ALERT_AFTER = 6  # 6 невдалих запусків поспіль (~3 год) -> одне попередження
 GKEY = f"GPV{GROUP}"
+TG_ERRORS: list[str] = []
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
@@ -61,6 +62,7 @@ def send(text: str, silent=False) -> dict:
            disable_notification=str(silent).lower())
     if not r.get("ok"):
         print("Telegram error:", r, file=sys.stderr)
+        TG_ERRORS.append(r.get("description", str(r)))
     return r
 
 
@@ -191,7 +193,8 @@ def main():
             send("⚠️ Вже ~3 год не вдається отримати графік із сайту ДТЕК. "
                  "Показую останній відомий (закріплене повідомлення).")
         save_state(st)
-        return
+        print("::error::Сайт ДТЕК не віддав графік (див. лог вище)")
+        sys.exit(1)
     if st.get("fails", 0) >= FAIL_ALERT_AFTER:
         send("✅ Зв'язок із сайтом ДТЕК відновлено.", silent=True)
     st["fails"] = 0
@@ -219,8 +222,15 @@ def main():
     body = "\n\n".join(format_day(ts, s) for ts, s in days.items()) or "Даних немає (N/A)"
     update_pinned(st, f"📌 <b>Актуальний графік — черга {GROUP}</b>\n\n{body}\n\nДТЕК оновив: {upd}")
 
+    if TG_ERRORS:
+        # не запам'ятовуємо графік, щоб наступний запуск надіслав його повторно
+        print(f"::error::Telegram не прийняв повідомлення: {TG_ERRORS[0]}. "
+              "Перевірте секрети BOT_TOKEN і CHAT_ID та чи натиснули ви /start у боті.")
+        save_state(st)
+        sys.exit(1)
     st["days"], st["update"] = days, upd
     save_state(st)
+    print(f"OK: черга {GROUP}, днів у графіку: {len(days)}, ДТЕК оновив: {upd}")
 
 
 if __name__ == "__main__":
