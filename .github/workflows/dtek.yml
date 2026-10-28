@@ -57,8 +57,17 @@ jobs:
       - name: Зберегти стан
         if: always()
         run: |
+          [ -f state.json ] || exit 0
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          [ -f state.json ] || exit 0
-          git add state.json
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
+          cp state.json "$RUNNER_TEMP/state.json"
+          for i in 1 2 3; do
+            git fetch -q origin "$GITHUB_REF_NAME"
+            git reset -q --hard "origin/$GITHUB_REF_NAME"
+            cp "$RUNNER_TEMP/state.json" state.json
+            git add state.json
+            git diff --cached --quiet && exit 0
+            git commit -qm "state" && git push -q origin "HEAD:$GITHUB_REF_NAME" && exit 0
+            echo "push не вдався, спроба $i"; sleep 5
+          done
+          exit 1
