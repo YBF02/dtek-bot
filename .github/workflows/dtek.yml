@@ -31,14 +31,28 @@ jobs:
           path: ~/.cache/ms-playwright
           key: pw-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - run: python -m playwright install --with-deps chromium
+      - name: Встановити браузер і віртуальний екран
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          python -m playwright install --with-deps chromium
 
-      - run: python dtek_notify.py
+      # cookies після проходження захисту сайту — щоб наступного разу пускало легше
+      - uses: actions/cache@v5
+        with:
+          path: .cache
+          key: browser-state-${{ github.run_id }}
+          restore-keys: browser-state-
+
+      - name: Перевірити графік
+        run: xvfb-run -a python dtek_notify.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GROUP: "5.2"
           DAILY_HOUR: "7"
+          HEADFUL: "1"
 
       - name: Зберегти стан
         if: always()
