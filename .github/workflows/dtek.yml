@@ -41,8 +41,10 @@ jobs:
           DAILY_HOUR: "7"
 
       - name: Зберегти стан
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ -f state.json ] || exit 0
           git add state.json
           git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
