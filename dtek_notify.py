@@ -67,32 +67,118 @@ def send(text: str, silent=False) -> dict:
 
 
 # ---------- ДТЕК ----------
-async def fetch_fact() -> dict:
+HEADFUL = os.getenv("HEADFUL") == "1"          # у GitHub запускаємо "видимий" браузер під Xvfb
+BROWSER_STATE = Path(os.getenv("BROWSER_STATE", ".cache/browser_state.json"))
+MIRROR_URL = ("https://raw.githubusercontent.com/mrkaktuz/outages-data/data/dtek-krem.json")
+SOURCE_USED = "сайт ДТЕК"
+
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['uk-UA', 'uk', 'en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+if (!window.chrome) window.chrome = {runtime: {}};
+"""
+
+READ_FACT_JS = """() => {
+  const f = window.DisconSchedule && window.DisconSchedule.fact;
+  return f && f.data && Object.keys(f.data).length ? f : null;
+}"""
+
+
+def fact_from_html(html: str):
+    """Запасний розбір: вирізати DisconSchedule.fact = {...} з HTML."""
+    i = html.find("DisconSchedule.fact")
+    if i < 0:
+        return None
+    i = html.find("{", i)
+    depth, j, in_str, esc = 0, i, None, False
+    while 0 <= j < len(html):
+        c = html[j]
+        if in_str:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == in_str: in_str = None
+        elif c in "\"'": in_str = c
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    f = json.loads(html[i:j + 1])
+                    return f if f.get("data") else None
+                except ValueError:
+                    return None
+        j += 1
+    return None
+
+
+async def fetch_from_site() -> dict:
     from playwright.async_api import async_playwright
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=True, args=["--disable-blink-features=AutomationControlled"])
-        ctx = await browser.new_context(user_agent=UA, locale="uk-UA", timezone_id="Europe/Kyiv")
-        last = None
-        for attempt in range(1, 4):
-            page = await ctx.new_page()
-            try:
-                await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_function(
-                    "() => window.DisconSchedule && window.DisconSchedule.fact"
-                    " && window.DisconSchedule.fact.data", timeout=60_000)
-                fact = await page.evaluate("() => window.DisconSchedule.fact")
-                if fact and fact.get("data"):
-                    await browser.close()
-                    return fact
-            except Exception as e:
-                last = e
-                print(f"Спроба {attempt}: {e}", file=sys.stderr)
-            finally:
-                await page.close()
-            await asyncio.sleep(10 * attempt)
-        await browser.close()
-        raise RuntimeError(f"Не вдалося отримати графік: {last}")
+            headless=not HEADFUL,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"])
+        ctx = await browser.new_context(
+            user_agent=UA, locale="uk-UA", timezone_id="Europe/Kyiv",
+            viewport={"width": 1366, "height": 768},
+            storage_state=str(BROWSER_STATE) if BROWSER_STATE.exists() else None)
+        await ctx.add_init_script(STEALTH_JS)
+        try:
+            for attempt in range(1, 3):
+                page = await ctx.new_page()
+                try:
+                    await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + 90
+                    reloads = 0
+                    while loop.time() < deadline:
+                        fact = await page.evaluate(READ_FACT_JS)
+                        if not fact:
+                            fact = fact_from_html(await page.content())
+                        if fact:
+                            BROWSER_STATE.parent.mkdir(parents=True, exist_ok=True)
+                            await ctx.storage_state(path=str(BROWSER_STATE))
+                            print(f"Сайт ДТЕК: OK (спроба {attempt}, перезавантажень {reloads})")
+                            return fact
+                        html = (await page.content()).lower()
+                        stub = "incapsula" in html or "imperva" in html or len(html) < 5000
+                        await page.wait_for_timeout(3000 if stub else 1500)
+                        if stub:
+                            reloads += 1
+                            await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    print(f"Сайт ДТЕК: спроба {attempt} — дані не з'явились за 90 с", file=sys.stderr)
+                except Exception as e:
+                    print(f"Сайт ДТЕК: спроба {attempt} — {e}", file=sys.stderr)
+                finally:
+                    await page.close()
+                await asyncio.sleep(5)
+        finally:
+            await browser.close()
+    raise RuntimeError("сайт ДТЕК не віддав графік")
+
+
+def fetch_from_mirror() -> dict:
+    """Публічна копія тих самих даних ДТЕК (github.com/mrkaktuz/outages-data)."""
+    with urllib.request.urlopen(MIRROR_URL, timeout=30) as r:
+        d = json.load(r)
+    fact = (d.get("raw") or {}).get("fact") or {}
+    if not (d.get("status") or {}).get("ok") or not fact.get("data"):
+        raise RuntimeError("дзеркало без даних")
+    print(f"Дзеркало: OK (ДТЕК оновив {fact.get('update')})")
+    return fact
+
+
+async def fetch_fact() -> dict:
+    global SOURCE_USED
+    try:
+        return await fetch_from_site()
+    except Exception as e:
+        print(f"{e}; пробую запасне джерело", file=sys.stderr)
+    fact = await asyncio.to_thread(fetch_from_mirror)
+    SOURCE_USED = "копія даних ДТЕК (outages-data)"
+    return fact
 
 
 # ---------- обробка ----------
@@ -104,7 +190,8 @@ def day_slots(hours: dict) -> list[int]:
 
 
 def extract_group(fact: dict) -> dict[str, list[int]]:
-    today = int(fact.get("today", 0))
+    midnight = int(datetime.now(KYIV).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    today = max(int(fact.get("today", 0)), midnight)
     days = {str(int(ts)): day_slots(g[GKEY])
             for ts, g in fact["data"].items() if int(ts) >= today and GKEY in g}
     return dict(sorted(days.items(), key=lambda kv: int(kv[0])))
@@ -193,7 +280,7 @@ def main():
             send("⚠️ Вже ~3 год не вдається отримати графік із сайту ДТЕК. "
                  "Показую останній відомий (закріплене повідомлення).")
         save_state(st)
-        print("::error::Сайт ДТЕК не віддав графік (див. лог вище)")
+        print("::error::Ні сайт ДТЕК, ні запасне джерело не віддали графік (див. лог вище)")
         sys.exit(1)
     if st.get("fails", 0) >= FAIL_ALERT_AFTER:
         send("✅ Зв'язок із сайтом ДТЕК відновлено.", silent=True)
@@ -207,7 +294,7 @@ def main():
         old = st["days"].get(ts)
         if old != slots:
             head = "🆕 Новий графік" if old is None else "🔄 Графік змінено"
-            send(f"{head} — черга {GROUP}\n\n{format_day(ts, slots)}\n\nДТЕК оновив: {upd}")
+            send(f"{head} — черга {GROUP}\n\n{format_day(ts, slots)}\n\nДТЕК оновив: {upd}\nДжерело: {SOURCE_USED}")
 
     # 2) щоденне повідомлення
     now = datetime.now(KYIV)
@@ -220,7 +307,7 @@ def main():
 
     # 3) закріплене повідомлення
     body = "\n\n".join(format_day(ts, s) for ts, s in days.items()) or "Даних немає (N/A)"
-    update_pinned(st, f"📌 <b>Актуальний графік — черга {GROUP}</b>\n\n{body}\n\nДТЕК оновив: {upd}")
+    update_pinned(st, f"📌 <b>Актуальний графік — черга {GROUP}</b>\n\n{body}\n\nДТЕК оновив: {upd}\nДжерело: {SOURCE_USED}")
 
     if TG_ERRORS:
         # не запам'ятовуємо графік, щоб наступний запуск надіслав його повторно
